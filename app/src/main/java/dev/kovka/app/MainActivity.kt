@@ -5,7 +5,6 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.widget.Toast
@@ -13,22 +12,17 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.setValue
 import androidx.core.content.FileProvider
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 
-internal data class Environment(val installed: Boolean, val allowed: Boolean, val ready: Boolean)
-
 class MainActivity : ComponentActivity() {
-    private var environment by mutableStateOf(Environment(false, false, false))
     private var pendingInstall: File? = null
-
-    private val permission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
-        updateEnvironment()
-        if (!it) toast("Разрешение также доступно в настройках приложения.")
-    }
 
     private val installPermission = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
         val file = pendingInstall
@@ -38,20 +32,22 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        pendingInstall = savedInstanceState?.getString("pendingInstall")?.let(::File)
         enableEdgeToEdge(
             statusBarStyle = androidx.activity.SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
             navigationBarStyle = androidx.activity.SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
         )
-        updateEnvironment()
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                InstallJournal.userAction.collect { action ->
+                    if (action != null) InstallJournal.consumeAction()?.let(::launchIntent)
+                }
+            }
+        }
         setContent {
             KovkaTheme {
                 Kovka(
-                    environment = environment,
-                    onEnvironmentChanged = ::updateEnvironment,
                     onOpenUrl = ::openUrl,
-                    onOpenTermux = ::openTermux,
-                    onPermission = { permission.launch(TERMUX_PERMISSION) },
-                    onSettings = ::appSettings,
                     onCopy = ::copy,
                     onStart = ::startBuild,
                     onInstall = ::install,
@@ -61,35 +57,22 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    override fun onResume() {
-        super.onResume()
-        updateEnvironment()
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        pendingInstall?.let { outState.putString("pendingInstall", it.absolutePath) }
     }
 
-    private fun updateEnvironment() {
-        val installed = packageManager.getLaunchIntentForPackage(TERMUX_PACKAGE) != null
-        val allowed = installed && BuildService.hasPermission(this)
-        val ready = allowed && getSharedPreferences("environment", MODE_PRIVATE).getBoolean("ready", false)
-        environment = Environment(installed, allowed, ready)
-    }
-
-    private fun startBuild(request: BuildRequest?) {
+    private fun startBuild(request: BuildRequest) {
+        getSharedPreferences("environment", MODE_PRIVATE).edit().putBoolean("sdkTerms", true).apply()
         runCatching { BuildService.start(this, request) }
             .onFailure { toast(it.localizedMessage ?: "Не удалось запустить сборку.") }
     }
 
-    private fun appSettings() = launch(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
-
-    private fun openTermux() {
-        val intent = packageManager.getLaunchIntentForPackage(TERMUX_PACKAGE)
-        if (intent != null) launch(intent) else openUrl("https://f-droid.org/packages/com.termux/")
-    }
-
-    private fun openUrl(url: String) = launch(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+    private fun openUrl(url: String) = launchIntent(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
 
     private fun copy(text: String) {
         getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("Ковка", text))
-        if (Build.VERSION.SDK_INT < 33) toast("Скопировано")
+        if (android.os.Build.VERSION.SDK_INT < 33) toast("Скопировано")
     }
 
     private fun install(file: File) {
@@ -104,32 +87,34 @@ class MainActivity : ComponentActivity() {
                 installPermission.launch(intent)
             } catch (_: ActivityNotFoundException) {
                 pendingInstall = null
-                toast("Откройте настройки и разрешите Ковке устанавливать приложения.")
+                toast("Разрешите Ковке устанавливать приложения в настройках Android.")
             }
             return
         }
-        val uri = apkUri(file)
-        launch(Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, APK_MIME)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            clipData = ClipData.newRawUri("APK", uri)
-        })
+        lifecycleScope.launch {
+            val failure = withContext(Dispatchers.IO) {
+                runCatching { InstallJournal.commit(this@MainActivity, file) }.exceptionOrNull()
+            }
+            if (failure != null) {
+                val id = requireNotNull(file.parentFile).name
+                InstallJournal.append(this@MainActivity, id, failure.localizedMessage ?: "Не удалось начать установку")
+                toast("Не удалось начать установку.")
+            }
+        }
     }
 
     private fun share(file: File) {
         if (!file.isFile) return
-        val uri = apkUri(file)
-        launch(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
-            type = APK_MIME
+        val uri = FileProvider.getUriForFile(this, "$packageName.artifacts", file)
+        launchIntent(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+            type = "application/vnd.android.package-archive"
             putExtra(Intent.EXTRA_STREAM, uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             clipData = ClipData.newRawUri("APK", uri)
         }, "Поделиться APK"))
     }
 
-    private fun apkUri(file: File): Uri = FileProvider.getUriForFile(this, "$packageName.artifacts", file)
-
-    private fun launch(intent: Intent) {
+    private fun launchIntent(intent: Intent) {
         try {
             startActivity(intent)
         } catch (_: ActivityNotFoundException) {
@@ -138,8 +123,4 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_LONG).show()
-
-    private companion object {
-        const val APK_MIME = "application/vnd.android.package-archive"
-    }
 }

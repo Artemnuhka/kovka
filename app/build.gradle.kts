@@ -8,12 +8,18 @@ android {
     compileSdk = 37
     defaultConfig {
         applicationId = "dev.kovka.app"
-        minSdk = 26
+        minSdk = 28
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.1.0"
     }
     buildFeatures { compose = true }
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+            keepDebugSymbols += setOf("**/libproot*.so")
+        }
+    }
     buildTypes {
         release {
             isMinifyEnabled = true
@@ -34,4 +40,5 @@ dependencies {
     implementation("androidx.compose.material3:material3:1.5.0-rc01")
     implementation("androidx.compose.material:material-icons-core:1.7.8")
     implementation("androidx.core:core-ktx:1.16.0")
+    implementation("org.apache.commons:commons-compress:1.28.0")
 }

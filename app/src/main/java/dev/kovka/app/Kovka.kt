@@ -3,6 +3,8 @@ package dev.kovka.app
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -17,7 +19,6 @@ import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.KeyboardArrowRight
 import androidx.compose.material.icons.rounded.Search
-import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Star
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -43,21 +44,15 @@ import java.util.Locale
 
 private enum class Destination(val title: String, val icon: ImageVector) {
     CATALOG("Каталог", Icons.Rounded.Search),
-    BUILDS("Сборки", Icons.Rounded.Build),
-    ENVIRONMENT("Среда", Icons.Rounded.Settings)
+    BUILDS("Сборки", Icons.Rounded.Build)
 }
 
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 internal fun Kovka(
-    environment: Environment,
-    onEnvironmentChanged: () -> Unit,
     onOpenUrl: (String) -> Unit,
-    onOpenTermux: () -> Unit,
-    onPermission: () -> Unit,
-    onSettings: () -> Unit,
     onCopy: (String) -> Unit,
-    onStart: (BuildRequest?) -> Unit,
+    onStart: (BuildRequest) -> Unit,
     onInstall: (File) -> Unit,
     onShare: (File) -> Unit
 ) {
@@ -67,7 +62,7 @@ internal fun Kovka(
     var destination by rememberSaveable { mutableStateOf(Destination.CATALOG) }
     var search by rememberSaveable { mutableStateOf("") }
     var query by rememberSaveable { mutableStateOf("") }
-    var language by rememberSaveable { mutableStateOf<String?>(null) }
+    var kind by rememberSaveable { mutableStateOf<ProjectKind?>(null) }
     var page by rememberSaveable { mutableIntStateOf(1) }
     var refresh by remember { mutableIntStateOf(0) }
     var results by remember { mutableStateOf(CatalogPage(emptyList(), false)) }
@@ -75,12 +70,16 @@ internal fun Kovka(
     var error by remember { mutableStateOf<String?>(null) }
     var selected by remember { mutableStateOf<Repository?>(null) }
     var history by remember { mutableStateOf(emptyList<BuildRecord>()) }
+    var logRepo by rememberSaveable { mutableStateOf<String?>(null) }
+    var logBuildId by rememberSaveable { mutableStateOf<String?>(null) }
+    var sdkTerms by remember { mutableStateOf(context.getSharedPreferences("environment", 0).getBoolean("sdkTerms", false)) }
+    val installUpdates by InstallJournal.updates.collectAsState()
 
-    LaunchedEffect(query, language, page, refresh) {
+    LaunchedEffect(query, kind, page, refresh) {
         fetching = true
         error = null
         try {
-            results = GitHub.search(query, language, page)
+            results = GitHub.search(query, kind, page)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (failure: Exception) {
@@ -94,7 +93,6 @@ internal fun Kovka(
     }
     LaunchedEffect(status?.phase) {
         history = withContext(Dispatchers.IO) { BuildHistory.list(context) }
-        if (status?.setup == true) onEnvironmentChanged()
     }
     BackHandler(destination != Destination.CATALOG) { destination = Destination.CATALOG }
 
@@ -116,7 +114,7 @@ internal fun Kovka(
                         onClick = { focus.clearFocus(); destination = item },
                         icon = {
                             BadgedBox(badge = {
-                                if (item == Destination.BUILDS && status?.active == true && status?.setup == false) {
+                                if (item == Destination.BUILDS && status?.active == true) {
                                     Badge(containerColor = Ember)
                                 }
                             }) { Icon(item.icon, null) }
@@ -147,14 +145,9 @@ internal fun Kovka(
                                         Icon(Icons.Rounded.Build, null, Modifier.padding(10.dp).size(20.dp), tint = Ember)
                                     }
                                     Text("Ковка", Modifier.weight(1f).padding(start = 11.dp), style = MaterialTheme.typography.titleLarge)
-                                    AssistChip(
-                                        onClick = { destination = Destination.ENVIRONMENT },
-                                        label = { Text(if (environment.ready) "Среда готова" else "Настроить") },
-                                        leadingIcon = {
-                                            Icon(if (environment.ready) Icons.Rounded.Check else Icons.Rounded.Settings, null,
-                                                Modifier.size(16.dp), tint = if (environment.ready) Mint else Ember)
-                                        }
-                                    )
+                                    if (status?.active == true) {
+                                        TextButton(onClick = { logRepo = status?.title }) { Text("Логи сборки") }
+                                    }
                                 }
                             }
                             if (query.isBlank() && page == 1) item { ForgeBanner() }
@@ -185,13 +178,16 @@ internal fun Kovka(
                                 )
                             }
                             item {
-                                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    listOf(null, "Kotlin", "Java").forEach { value ->
+                                Row(
+                                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    (listOf(null) + ProjectKind.entries).forEach { value ->
                                         FilterChip(
-                                            selected = language == value,
-                                            onClick = { if (language != value) { language = value; page = 1 }; focus.clearFocus() },
-                                            label = { Text(value ?: "Все") },
-                                            leadingIcon = if (language == value) {
+                                            selected = kind == value,
+                                            onClick = { if (kind != value) { kind = value; page = 1 }; focus.clearFocus() },
+                                            label = { Text(value?.title ?: "Все") },
+                                            leadingIcon = if (kind == value) {
                                                 { Icon(Icons.Rounded.Check, null, Modifier.size(16.dp)) }
                                             } else null,
                                             shape = CircleShape,
@@ -203,7 +199,7 @@ internal fun Kovka(
                             item {
                                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                                     Text(
-                                        if (query.isBlank()) "Проекты для Android" else "Результаты поиска",
+                                        if (query.isBlank() && kind == null) "Популярные приложения" else if (query.isBlank()) kind?.title.orEmpty() else "Результаты поиска",
                                         Modifier.weight(1f), style = MaterialTheme.typography.titleLarge
                                     )
                                     Text("GitHub", color = Muted, style = MaterialTheme.typography.labelMedium)
@@ -220,7 +216,12 @@ internal fun Kovka(
                                     MessageCard("Нет проектов на этой странице", "Уточните запрос или вставьте ссылку на репозиторий.")
                                 }
                                 else -> items(results.repositories, key = { it.fullName }) { repository ->
-                                    RepoCard(repository) { selected = repository }
+                                    val active = status?.takeIf { it.title.equals(repository.fullName, true) }
+                                    val hasLogs = active != null || history.any { it.repository.equals(repository.fullName, true) }
+                                    RepoCard(
+                                        repository, active?.phase?.title, { selected = repository },
+                                        if (hasLogs) ({ logRepo = repository.fullName }) else null
+                                    )
                                 }
                             }
                             if (!fetching && error == null && (page > 1 || results.hasMore)) item {
@@ -239,8 +240,8 @@ internal fun Kovka(
                         }
                         Destination.BUILDS -> {
                             item { PageHeading("Сборки", "APK, собранные на этом устройстве") }
-                            val job = status?.takeUnless { it.setup }
-                            if (job != null) item { JobCard(job, onCopy) }
+                            val job = status
+                            if (job?.active == true) item { ActiveBuildCard(job) { logRepo = job.title } }
                             if (history.isEmpty() && job == null) item {
                                 MessageCard("Пока пусто", "Откройте репозиторий в каталоге и запустите первую сборку.") {
                                     Button(onClick = { destination = Destination.CATALOG }, shapes = ButtonDefaults.shapes()) {
@@ -248,18 +249,14 @@ internal fun Kovka(
                                     }
                                 }
                             }
-                            items(history, key = { it.id }) { record -> ArtifactCard(record, onInstall, onShare) }
-                        }
-                        Destination.ENVIRONMENT -> {
-                            item { PageHeading("Среда", "Инструменты сборки на телефоне") }
-                            item {
-                                EnvironmentCard(
-                                    environment, status?.active == true, onOpenTermux, onPermission,
-                                    onSettings, onOpenUrl, onCopy, { onStart(null) }
-                                )
+                            items(history, key = { it.id }) { record ->
+                                ArtifactCard(record, onInstall, onShare) {
+                                    logBuildId = record.id
+                                    logRepo = record.repository
+                                }
                             }
-                            status?.takeIf { it.setup }?.let { job -> item { JobCard(job, onCopy) } }
                         }
+
                     }
                 }
             }
@@ -268,15 +265,33 @@ internal fun Kovka(
 
     selected?.let { repository ->
         RepositoryDialog(
-            repository = repository, environmentReady = environment.ready,
+            repository = repository, sdkTerms = sdkTerms,
             busy = status?.active == true, onDismiss = { selected = null },
             onOpen = { onOpenUrl(repository.url) },
-            onConfigure = { selected = null; destination = Destination.ENVIRONMENT },
+            onOpenTerms = { onOpenUrl("https://developer.android.com/studio/terms") },
             onBuild = { request ->
                 selected = null
+                sdkTerms = true
                 destination = Destination.BUILDS
                 onStart(request)
             }
+        )
+    }
+    logRepo?.let { repository ->
+        val active = status?.takeIf { it.title.equals(repository, true) && (logBuildId == null || it.id == logBuildId) }
+        val latest = history.firstOrNull { it.repository.equals(repository, true) && (logBuildId == null || it.id == logBuildId) }
+        val record = latest?.takeIf { active?.active != true }
+        val installerLog = remember(record?.id, installUpdates) {
+            record?.id?.let { InstallJournal.read(context, it) }.orEmpty()
+        }
+        LogsDialog(
+            repository = repository,
+            status = active?.phase?.title ?: if (record?.success == true) "APK готов" else "Сборка не завершилась",
+            running = active?.active == true,
+            buildLog = if (active?.active == true) active.log else record?.log ?: active?.log.orEmpty(),
+            installLog = installerLog,
+            onCopy = onCopy,
+            onDismiss = { logRepo = null; logBuildId = null }
         )
     }
 }
@@ -350,7 +365,7 @@ private fun ForgeIllustration(modifier: Modifier) {
 
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
-private fun RepoCard(repository: Repository, onClick: () -> Unit) {
+private fun RepoCard(repository: Repository, status: String?, onClick: () -> Unit, onLogs: (() -> Unit)?) {
     val accents = listOf(Ember, Mint, Color(0xFFF0B9CA), Color(0xFFE5C2A2))
     val accent = accents[Math.floorMod(repository.fullName.hashCode(), accents.size)]
     Surface(onClick = onClick, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(22.dp), color = Panel) {
@@ -370,11 +385,13 @@ private fun RepoCard(repository: Repository, onClick: () -> Unit) {
                         maxLines = 2, overflow = TextOverflow.Ellipsis)
                 }
                 Spacer(Modifier.height(7.dp))
-                Text(listOf(repository.language, repository.license).filter { it.isNotBlank() }.joinToString("  ·  "),
+                Text(listOf(repository.kind?.title ?: repository.language, repository.license).filter { it.isNotBlank() }.joinToString("  ·  "),
                     style = MaterialTheme.typography.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (status != null) Text(status, color = Ember, style = MaterialTheme.typography.labelSmall)
+                if (onLogs != null) TextButton(onClick = onLogs, contentPadding = PaddingValues(0.dp)) { Text("Логи") }
             }
             Column(horizontalAlignment = Alignment.End) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                if (repository.stars > 0) Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(Icons.Rounded.Star, "Звёзды GitHub", Modifier.size(14.dp), tint = Ember)
                     Spacer(Modifier.width(3.dp))
                     Text(formatStars(repository.stars), style = MaterialTheme.typography.labelSmall, color = Ember)
