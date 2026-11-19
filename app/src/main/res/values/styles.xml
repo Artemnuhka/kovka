@@ -1,0 +1,7 @@
+<resources>
+    <style name="Theme.Kovka" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#171410</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:colorAccent">#FFB86C</item>
+    </style>
+</resources>
